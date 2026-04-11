@@ -29,7 +29,6 @@ import argparse
 import time
 import datetime
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -56,26 +55,21 @@ from cl_plugin import E2DReplayPlugin
 # ══════════════════════════════════════════════════════════════════════
 
 class CosineLRPlugin(SupervisedPlugin):
-    def __init__(self, total_epochs: int, initial_lr: float, eta_min: float = 0.0):
+    def __init__(self, total_epochs: int, eta_min: float = 0.0):
         super().__init__()
         self.total_epochs = int(total_epochs)
         self.eta_min      = float(eta_min)
-        self._initial_lr  = float(initial_lr)
         self.scheduler    = None
 
     def before_training_exp(self, strategy, **kwargs) -> None:
-        # Always reset LR to initial value — handles resume where optimizer
-        # is loaded with LR=0 from the end of the previous experience.
-        for pg in strategy.optimizer.param_groups:
-            pg["lr"] = self._initial_lr
-
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             strategy.optimizer,
             T_max=self.total_epochs,
             eta_min=self.eta_min,
         )
+        lr     = strategy.optimizer.param_groups[0]["lr"]
         exp_id = strategy.experience.current_experience
-        print(f"[CosineLR] Exp {exp_id} | start lr={self._initial_lr:.6f} | T_max={self.total_epochs}")
+        print(f"[CosineLR] Exp {exp_id} | start lr={lr:.6f} | T_max={self.total_epochs}")
 
     def after_training_epoch(self, strategy, **kwargs) -> None:
         if self.scheduler is not None:
@@ -88,8 +82,7 @@ class CosineLRPlugin(SupervisedPlugin):
 #  Benchmark builders
 # ══════════════════════════════════════════════════════════════════════
 
-def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int,
-                         n_classes: Optional[int] = None):
+def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int):
     """
     Split ImageNet-1K (1000 classes, 224×224) using Avalanche's nc_benchmark.
 
@@ -123,7 +116,6 @@ def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int,
     train_ds = ImageNet(root=imagenet_path, split="train", transform=train_tf)
     val_ds   = ImageNet(root=imagenet_path, split="val",   transform=val_tf)
 
-    total_classes = n_classes if n_classes is not None else 1000
     benchmark = nc_benchmark(
         train_dataset=train_ds,
         test_dataset=val_ds,
@@ -131,14 +123,12 @@ def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int,
         shuffle=False,   # deterministic class split keeps class→task mapping stable
         seed=seed,
         task_labels=False,
-        fixed_class_order=list(range(total_classes)),
     )
-    return benchmark, total_classes, 224
+    return benchmark, 1000, 224
 
 
 def build_split_tiny_imagenet(n_experiences: int, seed: int,
-                               dataset_root: str = "~/.avalanche/data",
-                               n_classes: Optional[int] = None):
+                               dataset_root: str = "~/.avalanche/data"):
     """
     Split Tiny-ImageNet (200 classes, 64×64).
     Avalanche downloads and extracts it automatically on first run (~240 MB).
@@ -152,16 +142,14 @@ def build_split_tiny_imagenet(n_experiences: int, seed: int,
             "Upgrade avalanche-lib: pip install -U avalanche-lib"
         )
 
-    total_classes = n_classes if n_classes is not None else 200
     benchmark = SplitTinyImageNet(
         n_experiences=n_experiences,
         seed=seed,
         dataset_root=str(Path(dataset_root).expanduser()),
         return_task_id=False,
         shuffle=True,
-        fixed_class_order=list(range(total_classes)),
     )
-    return benchmark, total_classes, 64
+    return benchmark, 200, 64
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -217,28 +205,8 @@ def build_evaluator() -> EvaluationPlugin:
 #  Strategy runner with timing
 # ══════════════════════════════════════════════════════════════════════
 
-def run_strategy(
-    strategy,
-    benchmark,
-    name: str,
-    checkpoint_dir: Optional[Path] = None,
-    resume: bool = False,
-) -> dict:
+def run_strategy(strategy, benchmark, name: str) -> dict:
     print(f"\n{'=' * 65}\n  Strategy: {name}\n{'=' * 65}")
-
-    # ── Resume: reload model + optimizer from last saved checkpoint ───
-    start_exp = 0
-    if resume and checkpoint_dir is not None:
-        ckpt_path = checkpoint_dir / f"{name}_latest.pt"
-        if ckpt_path.exists():
-            ckpt = torch.load(str(ckpt_path), map_location=strategy.model.device
-                              if hasattr(strategy.model, "device") else "cpu")
-            strategy.model.load_state_dict(ckpt["model"])
-            strategy.optimizer.load_state_dict(ckpt["optimizer"])
-            start_exp = int(ckpt["exp_id"]) + 1
-            print(f"[Resume] Loaded checkpoint: exp {ckpt['exp_id']} done → resuming from exp {start_exp}")
-        else:
-            print(f"[Resume] No checkpoint found at {ckpt_path}, starting from scratch.")
 
     t0       = time.time()
     ts_start = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -248,25 +216,9 @@ def run_strategy(
     for experience in benchmark.train_stream:
         exp_id = experience.current_experience
         cls    = experience.classes_in_this_experience
-
-        if exp_id < start_exp:
-            print(f"[Resume] Skipping exp {exp_id} (already completed)")
-            continue
-
         print(f"\n--- Exp {exp_id} | classes {cls} ---")
         strategy.train(experience)
         results.append(strategy.eval(benchmark.test_stream))
-
-        # ── Save checkpoint after each experience ─────────────────────
-        if checkpoint_dir is not None:
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_path = checkpoint_dir / f"{name}_latest.pt"
-            torch.save({
-                "exp_id":    exp_id,
-                "model":     strategy.model.state_dict(),
-                "optimizer": strategy.optimizer.state_dict(),
-            }, str(ckpt_path))
-            print(f"[Checkpoint] Saved after exp {exp_id} → {ckpt_path}")
 
     elapsed  = time.time() - t0
     ts_end   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -319,16 +271,9 @@ def main():
     parser.add_argument("--output-dir",    type=str, default="./e2d_cl_output",
                         help="Root for synthetic images and per-task soft labels")
     parser.add_argument("--recover-script",type=str, default="./recover_cl.py")
-    parser.add_argument("--checkpoint-dir", type=str, default=None,
-                        help="Directory to save/load checkpoints. Defaults to {output-dir}/checkpoints")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume training from the latest checkpoint")
 
     # ── CL scenario ──────────────────────────────────────────────────
     parser.add_argument("--n-experiences", type=int, default=10)
-    parser.add_argument("--n-classes",     type=int, default=100,
-                        help="Number of classes to use (subset). "
-                             "Max 200 for --dataset tiny, 1000 for imagenet.")
     parser.add_argument("--seed",          type=int, default=42)
 
     # ── Student ──────────────────────────────────────────────────────
@@ -398,14 +343,12 @@ def main():
     # ── Build benchmark ───────────────────────────────────────────────
     if args.dataset == "imagenet":
         benchmark, num_classes, img_size = build_split_imagenet(
-            args.imagenet_path, args.n_experiences, args.seed,
-            n_classes=args.n_classes,
+            args.imagenet_path, args.n_experiences, args.seed
         )
         train_data_path = str(Path(args.imagenet_path) / "train")
     else:
         benchmark, num_classes, img_size = build_split_tiny_imagenet(
-            args.n_experiences, args.seed, args.tiny_data_root,
-            n_classes=args.n_classes,
+            args.n_experiences, args.seed, args.tiny_data_root
         )
         # recover_cl.py reads real images from here for BN stats
         train_data_path = str(
@@ -413,24 +356,19 @@ def main():
             / "tiny-imagenet-200" / "train"
         )
 
-    n_gpus = torch.cuda.device_count() if not args.no_cuda else 0
     print(f"Dataset      : {args.dataset}  ({num_classes} classes, {img_size}×{img_size})")
-    print(f"Device       : {device}  ({n_gpus} GPU(s) available)")
+    print(f"Device       : {device}")
     print(f"Student arch : {args.student_arch}")
     print(f"Experiences  : {args.n_experiences}  ({num_classes // args.n_experiences} classes each)")
     print(f"IPC          : {args.ipc}  |  fixed-per-class: {args.fixed_per_class}")
 
-    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else Path(args.output_dir) / "checkpoints"
-
-    common_plugins = [CosineLRPlugin(total_epochs=args.epochs, initial_lr=args.lr)]
+    common_plugins = [CosineLRPlugin(total_epochs=args.epochs)]
     results_table  = []
 
     # ── Strategy 1: Random Replay ─────────────────────────────────────
     if args.strategy in ("all", "random"):
         mem_size  = args.ipc * num_classes if args.fixed_per_class else args.ipc
         model     = build_student(args.student_arch, num_classes, img_size).to(device)
-        if n_gpus > 1:
-            model = nn.DataParallel(model)
         optimizer = make_optimizer(model, args)
         strategy  = Naive(
             model=model,
@@ -443,8 +381,7 @@ def main():
             evaluator=build_evaluator(),
             plugins=list(common_plugins) + [ReplayPlugin(mem_size=mem_size)],
         )
-        results_table.append(run_strategy(strategy, benchmark, "RandomReplay",
-                                          checkpoint_dir=checkpoint_dir, resume=args.resume))
+        results_table.append(run_strategy(strategy, benchmark, "RandomReplay"))
 
     # ── Strategy 2: E2D Replay ────────────────────────────────────────
     if args.strategy in ("all", "e2d"):
@@ -474,8 +411,6 @@ def main():
             kd_temperature=args.kd_temperature,
         )
         model     = build_student(args.student_arch, num_classes, img_size).to(device)
-        if n_gpus > 1:
-            model = nn.DataParallel(model)
         optimizer = make_optimizer(model, args)
         strategy  = Naive(
             model=model,
@@ -488,8 +423,7 @@ def main():
             evaluator=build_evaluator(),
             plugins=list(common_plugins) + [e2d_plugin],
         )
-        results_table.append(run_strategy(strategy, benchmark, "E2DReplay",
-                                          checkpoint_dir=checkpoint_dir, resume=args.resume))
+        results_table.append(run_strategy(strategy, benchmark, "E2DReplay"))
 
     # ── Summary table ─────────────────────────────────────────────────
     if results_table:

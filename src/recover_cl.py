@@ -48,6 +48,14 @@ from torchvision.transforms import functional as F
 from torch.amp import autocast, GradScaler
 import torch.cuda
 
+from tiny_teachers import (
+    load_tiny_teacher_ensemble,
+    maybe_print_tiny_class_mapping,
+    parse_teacher_checkpoints,
+    tiny_avalanche_to_imagefolder_indices,
+)
+from normalization import as_float_lists, describe_normalization, normalization_names
+
 
 def set_seed(seed):
     """Set the random seed for reproducibility."""
@@ -64,7 +72,7 @@ def set_seed(seed):
 
 def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
                 ipc_id_range, K, loss_threshold, AMP,
-                class_ids):          # ← ADDED: explicit class list
+                class_ids, teacher_class_ids):          # ← ADDED: explicit class list
     args.gpu = gpu
     print("Use GPU: {} for training".format(args.gpu))
     args.rank = args.rank * ngpus_per_node + gpu
@@ -105,7 +113,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
                                       name=full_name, gpu=gpu,
                                       training_momentum=args.training_momentum,
                                       flatness_weight=args.flatness_weight,
-                                      category_aware=args.category_aware)
+                                      category_aware=args.category_aware,
+                                      num_classes=args.num_classes)
                 _hook.set_hook(pre=True)
                 load_tag = load_tag & _hook.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook.load_tag
@@ -117,7 +126,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
                                         training_momentum=args.training_momentum,
                                         drop_rate=args.drop_rate,
                                         flatness_weight=args.flatness_weight,
-                                        category_aware=args.category_aware)
+                                        category_aware=args.category_aware,
+                                        num_classes=args.num_classes)
                 _hook.set_hook(pre=True)
                 load_tag = load_tag & _hook.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook.load_tag
@@ -129,11 +139,10 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
         initial_img_cache = PreImgPathCache(
             args.initial_img_dir,
             transforms=transforms.Compose([
-                transforms.Resize((224, 224)),
+                transforms.Resize((args.image_size, args.image_size)),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=args.norm_mean, std=args.norm_std),
                 ShufflePatches(2),
             ]))
 
@@ -141,11 +150,10 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
         original_img_cache = PreImgPathCache(
             args.train_data_path,
             transforms=transforms.Compose([
-                transforms.Resize((224, 224)),
+                transforms.Resize((args.image_size, args.image_size)),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=args.norm_mean, std=args.norm_std),
             ]))
 
     if not load_tag:
@@ -154,22 +162,23 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
         # We filter ImageFolder to `class_ids` so only the task-visible images
         # are used. Stats are saved to a per-task subdirectory (statistic_path
         # already points to task_{T}/statistic/ via the plugin).
-        class_id_set = set(class_ids)
+        teacher_class_id_set = set(teacher_class_ids)
 
         full_dataset = torchvision.datasets.ImageFolder(
             root=args.train_data_path,
             transform=transforms.Compose([
-                transforms.RandomResizedCrop(224),
+                transforms.RandomResizedCrop(args.image_size),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=args.norm_mean, std=args.norm_std),
             ]))
 
-        # Keep only samples whose class index is in the current task
+        # Keep only samples whose teacher/ImageFolder class index is in the
+        # current task. For TinyImageNet this is not the same as Avalanche's
+        # class id because Avalanche follows wnids.txt order.
         task_indices = [
             i for i, (_, lbl) in enumerate(full_dataset.samples)
-            if lbl in class_id_set
+            if lbl in teacher_class_id_set
         ]
         task_subset = torch.utils.data.Subset(full_dataset, task_indices)
         train_loader = torch.utils.data.DataLoader(
@@ -202,6 +211,11 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
     # ── CL CHANGE: use task class_ids instead of np.arange(1000) ────
     n_classes = len(class_ids)
     targets_all_all = (
+        torch.LongTensor(teacher_class_ids)[None, ...]
+        .expand(len(ipc_id_range), n_classes)
+        .contiguous().view(-1)
+    )
+    save_class_all_all = (
         torch.LongTensor(class_ids)[None, ...]
         .expand(len(ipc_id_range), n_classes)
         .contiguous().view(-1)
@@ -230,6 +244,7 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
         ]
 
         targets = targets_all_all[sub_turn_index].cuda(gpu)
+        save_class_ids = save_class_all_all[sub_turn_index].cuda(gpu)
         ipc_ids = ipc_id_all[sub_turn_index].cuda(gpu)
 
         if targets.numel() == 0:
@@ -251,12 +266,12 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
             inputs.requires_grad_(True)
         else:
             inputs = torch.randn(
-                (sub_batch_size, 3, 224, 224),
+                (sub_batch_size, 3, args.image_size, args.image_size),
                 requires_grad=True, device=f"cuda:{gpu}", dtype=data_type,
             )
 
         if args.category_aware == "local":
-            expand_ratio = int(50000 / (args.ipc_number * 1000))
+            expand_ratio = max(1, int(50000 / (args.ipc_number * args.num_classes)))
             tea_images = torch.stack(
                 [original_img_cache.random_img_sample(_t)
                  for _t in (targets.tolist() * expand_ratio)], 0
@@ -276,7 +291,7 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
 
         class ExplorationExploitationAug:
             def __init__(self, bs):
-                self.cropper = transforms.RandomResizedCrop(224, scale=(0.5, 1))
+                self.cropper = transforms.RandomResizedCrop(args.image_size, scale=(0.5, 1))
                 self.flipper = transforms.RandomHorizontalFlip()
                 self.last_crops       = [None] * bs
                 self.selected_indices = [None] * bs
@@ -345,6 +360,7 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
             loss          = loss_ce + loss_aux + loss_ema_ce * args.flatness_weight
 
             loss_vals = loss_ce_all.detach().cpu().numpy()
+            loss_value = loss.item()
 
             for img_idx, (i, j, h, w) in enumerate(aug_fn.last_crops):
                 if loss_vals[img_idx] > loss_threshold and iteration <= K:
@@ -377,14 +393,23 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
                 loss.backward()
                 optimizer.step()
 
-            inputs.data = clip(inputs.data)
-            if gpu == 0 and (best_cost > loss.item() or iteration == 1):
+            for mod in loss_r_feature_layers[id_]:
+                if hasattr(mod, "r_feature"):
+                    mod.r_feature = None
+            del sub_outputs, loss, loss_aux, loss_r_feat, loss_ce, loss_ce_all, inputs_jit
+
+            inputs.data = clip(inputs.data, mean=args.norm_mean, std=args.norm_std)
+            if gpu == 0 and (best_cost > loss_value or iteration == 1):
                 best_inputs = inputs.data.clone()
 
         if args.store_best_images:
             best_inputs = inputs.data.clone()
-            best_inputs = denormalize(best_inputs)
-            save_images(args, best_inputs, targets, ipc_ids)
+            best_inputs = denormalize(
+                best_inputs,
+                mean=args.norm_mean,
+                std=args.norm_std,
+            )
+            save_images(args, best_inputs, save_class_ids, ipc_ids)
 
         optimizer.state = collections.defaultdict(dict)
         torch.cuda.empty_cache()
@@ -463,6 +488,16 @@ def main_syn():
     parser.add_argument("--verifier-arch",    type=str,   default="mobilenet_v2")
     parser.add_argument("--train-data-path",  type=str,   default="./imagenet/train")
     parser.add_argument("--statistic-path",   type=str,   default="./statistic")
+    parser.add_argument("--num-classes",      type=int,   default=1000,
+                        help="Teacher label-space size; use 200 for TinyImageNet teachers.")
+    parser.add_argument("--image-size",       type=int,   default=224,
+                        help="Synthetic image size and recovery crop size.")
+    parser.add_argument("--normalization",    type=str,   default="imagenet",
+                        choices=normalization_names(),
+                        help="Normalization preset used by teachers and recovery.")
+    parser.add_argument("--teacher-checkpoints", type=str, default=None,
+                        help="Comma-separated TinyImageNet teacher checkpoints. "
+                             "When provided, these replace torchvision ImageNet teachers.")
     parser.add_argument("--K",                type=int,   default=700)
     parser.add_argument("--seed",             type=int,   default=None)
     parser.add_argument("--loss-threshold",   type=float, default=0.5)
@@ -482,7 +517,9 @@ def main_syn():
     # ────────────────────────────────────────────────────────────────
 
     args = parser.parse_args()
+    args.norm_mean, args.norm_std = as_float_lists(args.normalization)
     print(args)
+    print(f"[recover_cl] Normalization: {describe_normalization(args.normalization)}")
 
     if args.seed is not None:
         set_seed(args.seed)
@@ -491,18 +528,48 @@ def main_syn():
     if args.class_ids is not None:
         class_ids = [int(x.strip()) for x in args.class_ids.split(",")]
     else:
-        class_ids = list(range(1000))   # original behaviour
+        class_ids = list(range(args.num_classes))   # original behaviour when num_classes=1000
     print(f"[recover_cl] Synthesising {len(class_ids)} classes: {class_ids[:10]}{'...' if len(class_ids) > 10 else ''}")
 
     args.syn_data_path = os.path.join(args.syn_data_path, args.exp_name)
     if not os.path.exists(args.syn_data_path):
         os.makedirs(args.syn_data_path)
 
-    aux_teacher   = ["resnet18", "mobilenet_v2", "efficientnet_b0",
-                     "shufflenet_v2_x0_5", "alexnet"]
-    args.aux_teacher = aux_teacher
-    model_teacher = [models.__dict__[n](pretrained=True) for n in aux_teacher]
-    model_verifier = models.__dict__[args.verifier_arch](pretrained=True)
+    teacher_checkpoints = parse_teacher_checkpoints(args.teacher_checkpoints)
+    class_index_map = None
+    if teacher_checkpoints:
+        class_index_map = tiny_avalanche_to_imagefolder_indices(
+            args.train_data_path,
+            num_classes=args.num_classes,
+        )
+        maybe_print_tiny_class_mapping(class_index_map, "[recover_cl]")
+        model_teacher = load_tiny_teacher_ensemble(
+            teacher_checkpoints,
+            device=None,
+            num_classes=args.num_classes,
+        )
+        args.aux_teacher = [
+            getattr(t, "teacher_name", t.__class__.__name__) for t in model_teacher
+        ]
+        model_verifier = nn.Identity()
+    else:
+        aux_teacher   = ["resnet18", "mobilenet_v2", "efficientnet_b0",
+                         "shufflenet_v2_x0_5", "alexnet"]
+        args.aux_teacher = aux_teacher
+        model_teacher = [models.__dict__[n](pretrained=True) for n in aux_teacher]
+        model_verifier = models.__dict__[args.verifier_arch](pretrained=True)
+
+    if class_index_map is None:
+        teacher_class_ids = class_ids
+    else:
+        teacher_class_ids = [class_index_map[cid] for cid in class_ids]
+        print(
+            "[recover_cl] Student->teacher targets: "
+            + ", ".join(
+                f"{sid}->{tid}" for sid, tid in zip(class_ids[:10], teacher_class_ids[:10])
+            )
+            + ("..." if len(class_ids) > 10 else "")
+        )
 
     ipc_id_range = list(range(0, args.ipc_number))
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
@@ -519,7 +586,7 @@ def main_syn():
             0, ngpus_per_node, args,
             model_teacher, model_verifier,
             ipc_id_range, args.K, args.loss_threshold, bool(args.AMP),
-            class_ids,
+            class_ids, teacher_class_ids,
         )
     else:
         torch.multiprocessing.set_start_method("spawn", force=True)
@@ -530,7 +597,7 @@ def main_syn():
                 ngpus_per_node, args,
                 model_teacher, model_verifier,
                 ipc_id_range, args.K, args.loss_threshold, bool(args.AMP),
-                class_ids,
+                class_ids, teacher_class_ids,
             ),
         )
 

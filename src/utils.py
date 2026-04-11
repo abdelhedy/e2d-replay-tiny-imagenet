@@ -70,32 +70,31 @@ def mom_cosine_policy(base_beta, warmup_length, epochs):
     return beta_policy(_beta_fn)
 
 
-def clip(image_tensor, use_fp16=False):
+def _norm_arrays(mean=None, std=None, use_fp16=False):
+    dtype = np.float16 if use_fp16 else np.float32
+    if mean is None:
+        mean = [0.485, 0.456, 0.406]
+    if std is None:
+        std = [0.229, 0.224, 0.225]
+    return np.array(mean, dtype=dtype), np.array(std, dtype=dtype)
+
+
+def clip(image_tensor, use_fp16=False, mean=None, std=None):
     '''
     adjust the input based on mean and variance
     '''
-    if use_fp16:
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float16)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float16)
-    else:
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
+    mean, std = _norm_arrays(mean=mean, std=std, use_fp16=use_fp16)
     for c in range(3):
         m, s = mean[c], std[c]
         image_tensor[:, c] = torch.clamp(image_tensor[:, c], -m / s, (1 - m) / s)
     return image_tensor
 
 
-def denormalize(image_tensor, use_fp16=False):
+def denormalize(image_tensor, use_fp16=False, mean=None, std=None):
     '''
     convert floats back to input
     '''
-    if use_fp16:
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float16)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float16)
-    else:
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
+    mean, std = _norm_arrays(mean=mean, std=std, use_fp16=use_fp16)
 
     for c in range(3):
         m, s = mean[c], std[c]
@@ -119,7 +118,7 @@ class EMA(object):
 
 class BNFeatureHook():
     def __init__(self, module, save_path="./", training_momentum=0.4, name=None, gpu=0, flatness_weight=0.25,
-                      category_aware = 'global'):
+                      category_aware = 'global', num_classes=1000):
         self.module = module
         if module is not None and name is not None:
             self.hook = module.register_forward_hook(self.post_hook_fn)
@@ -132,15 +131,16 @@ class BNFeatureHook():
         self.tea_tag = False
         self.closeness = False
         self.flatness_weight = flatness_weight
-        for i in range(1000):
+        self.num_classes = int(num_classes)
+        for i in range(self.num_classes):
             cls_dir = os.path.join(save_path, f"BNFeatureHook", f"class_{i}", name)
             if not os.path.exists(cls_dir):
                 os.makedirs(cls_dir, exist_ok=True)
         self.category_save_path_list = [
-            os.path.join(save_path, f"BNFeatureHook", f"class_{i}", name, "running.npz") for i in range(1000)
+            os.path.join(save_path, f"BNFeatureHook", f"class_{i}", name, "running.npz") for i in range(self.num_classes)
         ]
-        self.category_running_dd_var_list = [0. for i in range(1000)]
-        self.category_running_dd_mean_list = [0. for i in range(1000)]
+        self.category_running_dd_var_list = [0. for i in range(self.num_classes)]
+        self.category_running_dd_mean_list = [0. for i in range(self.num_classes)]
         self.load_tag = True
         self.category_aware = category_aware
         if category_aware == "global":
@@ -152,7 +152,7 @@ class BNFeatureHook():
                     self.category_running_dd_mean_list[i] = torch.from_numpy(npz_file["running_dd_mean"]).cuda(gpu)
                 else:
                     self.load_tag = False
-                    self.counter = [0 for i in range(1000)]
+                    self.counter = [0 for i in range(self.num_classes)]
             if self.load_tag:
                 self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list,0)
                 self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list,0)
@@ -277,7 +277,7 @@ class BNFeatureHook():
 
 class ConvFeatureHook():
     def __init__(self, module=None, save_path="./", data_number=1281167, name=None, gpu=0, training_momentum=0.4,
-                 drop_rate=0.4, flatness_weight=0.25, category_aware = 'global'):
+                 drop_rate=0.4, flatness_weight=0.25, category_aware = 'global', num_classes=1000):
 
         self.module = module
         if module is not None and name is not None:
@@ -314,18 +314,19 @@ class ConvFeatureHook():
             self.running_patch_mean = 0.
 
         self.category_aware = category_aware
+        self.num_classes = int(num_classes)
         if category_aware == "global":
             self.category_save_path_list = [
-                os.path.join(save_path, f"ConvFeatureHook", f"class_{i}", name, "running.npz") for i in range(1000)
+                os.path.join(save_path, f"ConvFeatureHook", f"class_{i}", name, "running.npz") for i in range(self.num_classes)
             ]
-            for i in range(1000):
+            for i in range(self.num_classes):
                 cls_dir = os.path.join(save_path, f"ConvFeatureHook", f"class_{i}", name)
                 if not os.path.exists(cls_dir):
                     os.makedirs(cls_dir, exist_ok=True)
-            self.category_running_dd_var_list = [0. for i in range(1000)]
-            self.category_running_dd_mean_list = [0. for i in range(1000)]
-            self.category_running_patch_var_list = [0. for i in range(1000)]
-            self.category_running_patch_mean_list = [0. for i in range(1000)]
+            self.category_running_dd_var_list = [0. for i in range(self.num_classes)]
+            self.category_running_dd_mean_list = [0. for i in range(self.num_classes)]
+            self.category_running_patch_var_list = [0. for i in range(self.num_classes)]
+            self.category_running_patch_mean_list = [0. for i in range(self.num_classes)]
 
             for i, category_save_path in enumerate(self.category_save_path_list):
                 if os.path.exists(category_save_path):
@@ -337,7 +338,7 @@ class ConvFeatureHook():
                     self.category_running_patch_mean_list[i] = torch.from_numpy(npz_file["running_patch_mean"]).cuda(gpu)
                 else:
                     self.load_tag = False
-                    self.counter = [0 for i in range(1000)]
+                    self.counter = [0 for i in range(self.num_classes)]
 
             if self.load_tag:
                 self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list,0)
