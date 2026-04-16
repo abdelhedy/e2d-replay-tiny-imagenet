@@ -1,20 +1,30 @@
-# Virtual environment
+# Virtual environments
+.venv/
 e2d_env/
 
 # Training output (synthetic images, soft labels, checkpoints)
 e2d_cl_output/
+e2d_cl_smoke_test/
 
-# Python cache
-__pycache__/
-*.py[cod]
+# Model weights (too large for GitHub, see checkpoints/README.md)
+*.pth
+*.pt
 
 # BN/Conv statistics cache (large, regeneratable)
 BNFeatureHook/
 ConvFeatureHook/
 
+# Private project notes (local context only)
+docs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
 # Jupyter
 .ipynb_checkpoints/
 
-# OS
+# OS / editor
 .DS_Store
 Thumbs.db
+.vscode/
