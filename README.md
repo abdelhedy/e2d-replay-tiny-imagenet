@@ -144,7 +144,7 @@ python src/cl_train.py \
 
 - **Pretrained on all classes.** The teachers and the student backbone were pretrained on all 200 Tiny-ImageNet classes, and the backbone is frozen. The results therefore measure forgetting in the classifier head on top of fixed pretrained features, not representation learning from scratch.
 - **Small scale.** Each result comes from a single seed on a 20-class subset.
-- **Generation cost.** Synthesis dominates run time, at about 5.7 min per experience on 2× T4.
+- **Generation cost.** Synthesis takes about 60 % of run time (≈ 5.7 min per experience at 10 IPC on 2× T4).
 
 ## Perspectives
 
